@@ -5827,6 +5827,30 @@ static int search(u8 *array, u8 value, unsigned n)
 }
 
 /**
+ * Workqueue handler to toggle scroll mode.
+ * Reads the device state before the write, so sysfs and other tools stay in sync.
+ */
+static void scroll_toggle_worker(struct work_struct *work)
+{
+    struct razer_mouse_device *dev =
+        container_of(work, struct razer_mouse_device, scroll_toggle_work);
+    struct razer_report request = {0};
+    struct razer_report response = {0};
+
+    request = razer_chroma_misc_get_scroll_mode();
+    request.transaction_id.id = 0x1f;
+    if (razer_send_payload(dev, &request, &response)) {
+        printk(KERN_WARNING "razermouse: Couldn't read scroll mode\n");
+        return;
+    }
+
+    request = razer_chroma_misc_set_scroll_mode(response.arguments[1] ^ 1);
+    request.transaction_id.id = 0x1f;
+    if (razer_send_payload(dev, &request, &response))
+        printk(KERN_WARNING "razermouse: Couldn't set scroll mode\n");
+}
+
+/**
  * Raw event function
  */
 static int razer_raw_event(struct hid_device *hdev, struct hid_report *report, u8 *data, int size)
@@ -5887,13 +5911,14 @@ static int razer_raw_event(struct hid_device *hdev, struct hid_report *report, u
 
             for (i = 1; i < size; i++) {
                 if (!search(rdev->rep4 + 1, data[i], size - 1)) {
-                    if (data[i] == REP4_SCROLL)
+                    /* Basilisk V3 firmware leaves the scroll mode button to the host */
+                    if (data[i] == REP4_SCROLL && m_rdev->usb_pid == USB_DEVICE_ID_RAZER_BASILISK_V3)
                         schedule_work(&m_rdev->scroll_toggle_work);
                     else
                         input_rep4_code(m_rdev->input, data[i], 1);
                 }
                 if (!search(data + 1, rdev->rep4[i], size - 1)) {
-                    if (rdev->rep4[i] != REP4_SCROLL)
+                    if (rdev->rep4[i] != REP4_SCROLL || m_rdev->usb_pid != USB_DEVICE_ID_RAZER_BASILISK_V3)
                         input_rep4_code(m_rdev->input, rdev->rep4[i], 0);
                 }
             }
@@ -6009,17 +6034,6 @@ static int razer_input_configured(struct hid_device *hdev,
     }
 
     return 0;
-}
-
-static void scroll_toggle_worker(struct work_struct *work)
-{
-    struct razer_mouse_device *dev = container_of(work, struct razer_mouse_device, scroll_toggle_work);
-    struct razer_report request = {0};
-    struct razer_report response = {0};
-    dev->scroll_mode ^= 1;
-    request = razer_chroma_misc_set_scroll_mode(dev->scroll_mode);
-    request.transaction_id.id = 0x1f;
-    razer_send_payload(dev, &request, &response);
 }
 
 /**
@@ -8286,6 +8300,7 @@ static void razer_mouse_disconnect(struct hid_device *hdev)
 
     hid_hw_stop(hdev);
     hrtimer_cancel(&dev->repeat_timer);
+    cancel_work_sync(&dev->scroll_toggle_work);
 
     kfree(dev);
     dev_info(&intf->dev, "Razer Device disconnected\n");
